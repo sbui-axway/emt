@@ -1,0 +1,90 @@
+##
+# Stores Java heap settings in variable 'heap_size'. This can be passed as a command line
+# argument when starting a vshell process.
+##
+set_heap_size() {
+    heap_size=""
+    if [ ! -z "$EMT_HEAP_SIZE_MB" ]; then
+        # Set Java heap size based on value in env variable
+        if [[ "$EMT_HEAP_SIZE_MB" =~ ^[0-9]+$ ]]; then
+            echo "Setting Java heap size to $EMT_HEAP_SIZE_MB MB"
+            heap_size="-DinitialHeap=${EMT_HEAP_SIZE_MB}m -DmaxHeap=${EMT_HEAP_SIZE_MB}m"
+        else
+            echo "ERROR: Invalid value for environment variable EMT_HEAP_SIZE_MB: $EMT_HEAP_SIZE_MB"
+        fi
+    else
+        # Set Java heap size based on memory limit for cgroup, if set
+        local fraction="0.25"
+        local cgroup_mem_file="/sys/fs/cgroup/memory/memory.limit_in_bytes"
+
+        if [ -r "${cgroup_mem_file}" ]; then
+            local max_mem_cgroup="$(cat ${cgroup_mem_file})"
+            local max_mem_meminfo_kb="$(cat /proc/meminfo | awk '/MemTotal/ {print $2}')"
+            local max_mem_meminfo="$(expr $max_mem_meminfo_kb \* 1024)"
+
+            if [ ${max_mem_cgroup:-0} != -1 ] && [ ${max_mem_cgroup:-0} -lt ${max_mem_meminfo:-0} ]; then
+                local heap_size_mb=$(printf "%.0f" "$(awk "BEGIN {print ${max_mem_cgroup}*$fraction/1024/1024}")")
+                echo "Setting Java heap size to $heap_size_mb MB"
+                heap_size="-DinitialHeap=${heap_size_mb}m -DmaxHeap=${heap_size_mb}m"
+            fi
+        fi
+    fi
+}
+
+
+##
+# If a merge directory has been supplied, its files and directories are copied into $VDISTDIR.
+# If a merge FED has been supplied, it is unzipped and replaces the current FED.
+##
+merge_external_files() {
+    local bin_dir=$VDISTDIR/posix/bin
+    if [ -f "$bin_dir/start-emt-instance" ]; then
+        local gw_product="Gateway"
+        local merge_dir=/merge/apigateway
+        local fed_dir=$VDISTDIR/groups/emt-group/conf/$(sed -n 's/.*value="\(.*\)".*/\1/p' $VDISTDIR/groups/emt-group/emt-service/conf/esid.xml)
+    elif [ -f "$bin_dir/start-emt-nodemanager" ]; then
+        local gw_product="NodeManager"
+        local merge_dir=/merge/apigateway
+        local fed_dir=$VDISTDIR/conf/fed
+    else
+        local gw_product="Reporter"
+        local merge_dir=/merge/analytics
+        local fed_dir=$VDISTDIR/conf/fed
+    fi
+
+    if [ -d "$merge_dir" ] && [ -n "$(ls -A $merge_dir)" ]; then
+        echo "Merging directory $merge_dir into $VDISTDIR ..."
+        cp -rv $merge_dir/* $VDISTDIR/
+    fi
+
+    local merge_fed=/merge/fed
+    if [ -f "$merge_fed" ]; then
+        if python $bin_dir/unzip.py $merge_fed /tmp/fed 1>/dev/null 2>&1; then
+            if find /tmp/fed | grep -e "UserStore.*xml" 1>/dev/null 2>&1; then
+                local version_xpath='/*[local-name()="entityStoreData"]/*[local-name()="entity" and @type="ESConfiguration"]/*[local-name()="fval" and @name="version"]/*[local-name()="value"]/text()'
+                local product_xpath='/*[local-name()="entityStoreData"]/*[local-name()="entity" and @type="ESConfiguration"]/*[local-name()="fval" and @name="productKey"]/*[local-name()="value"]/text()'
+
+                local new_fed_dir=$(find /tmp/fed | grep -e "UserStore.*xml" | xargs dirname)
+                local gw_version=$(xmllint --xpath "$version_xpath" $fed_dir/UserStore*xml)
+                local fed_version=$(xmllint --xpath "$version_xpath" "$new_fed_dir"/UserStore*xml)
+                local fed_product=$(xmllint --xpath "$product_xpath" "$new_fed_dir"/UserStore*xml)
+
+                if [ "$fed_version" == "$gw_version" ]; then
+                    if [[ "$fed_product" == *"$gw_product"* ]]; then
+                        echo "Replacing contents of FED directory $fed_dir ..."
+                        rm -rf $fed_dir/*
+                        cp -rv "$new_fed_dir"/* $fed_dir/
+                    else
+                        echo "ERROR: Cannot use configuration in $merge_fed: product is $gw_product, FED productKey is '$fed_product'"
+                    fi
+                else
+                    echo "ERROR: Cannot use configuration in $merge_fed: FED version '$fed_version' does not match product version '$gw_version'" 
+                fi
+            else
+                echo "ERROR: Cannot use configuration in $merge_fed: FED file does not contain a valid configuration"
+            fi
+        else
+            echo "ERROR: Cannot use configuration in $merge_fed: not a valid FED file"
+        fi
+    fi
+}
